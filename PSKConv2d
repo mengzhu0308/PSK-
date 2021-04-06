@@ -1,0 +1,47 @@
+import torch
+from torch import nn
+
+class HardSoftmax(nn.Module):
+    def __init__(self, dim=1):
+        super(HardSoftmax, self).__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        x = torch.maximum(x + 1, 1 + x / (1 + torch.abs(x)))
+        return x / torch.sum(x, dim=self.dim, keepdim=True)
+
+    def extra_repr(self):
+        return f'{self.dim=}'
+
+class PSKConv2d(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, groups=1, M=2, dilation=1, reduction=4):
+        super(PSKConv2d, self).__init__()
+        m_planes = out_planes * M
+        inter_planes = max(max(in_planes, m_planes) // reduction, groups)
+        self.gconvs = nn.ModuleList([nn.Sequential(
+            nn.Conv2d(in_planes, out_planes, kernel_size + m * 2, stride=stride, padding=m + kernel_size // 2,
+                      bias=False, groups=groups, dilation=dilation),
+            nn.BatchNorm2d(out_planes)) for m in range(M)])
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.conv1 = nn.Conv2d(in_planes, inter_planes, 1, groups=groups, bias=False)
+        self.bn1 = nn.BatchNorm2d(inter_planes)
+        self.conv2 = nn.Conv2d(inter_planes, m_planes, 1, groups=groups)
+        self.relu = nn.ReLU(inplace=True)
+        self.softmax = HardSoftmax(dim=-1)
+        self.M = M
+
+    def forward(self, x):
+        batch_size = x.size(0)
+
+        sks = [self.relu(gconv(x)) for gconv in self.gconvs]
+        g = self.gap(x)
+        g = self.conv1(g)
+        g = self.bn1(g)
+        g = self.relu(g)
+        g = self.conv2(g)
+        g = g.view(batch_size, -1).view(batch_size, -1, self.M)
+        g = self.softmax(g)
+        attens = [g[..., m: (m + 1)].view(batch_size, -1, 1, 1) for m in range(self.M)]
+        x = sum([atten * sk for (atten, sk) in zip(attens, sks)])
+
+        return x.contiguous()
